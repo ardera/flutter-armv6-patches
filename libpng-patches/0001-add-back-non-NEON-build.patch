@@ -1,0 +1,36 @@
+From a2b30a0fd8c4652a7544fe83589f7ffb9abea00c Mon Sep 17 00:00:00 2001
+From: Hannes Winkler <hanneswinkler2000@web.de>
+Date: Tue, 7 May 2024 17:09:32 +0200
+Subject: [PATCH] add back non-NEON build
+
+---
+ BUILD.gn | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/BUILD.gn b/BUILD.gn
+index 3448491f1..d7ff8bd09 100644
+--- a/BUILD.gn
++++ b/BUILD.gn
+@@ -2,6 +2,10 @@
+ # Use of this source code is governed by a BSD-style license that can be
+ # found in the LICENSE file.
+ 
++declare_args() {
++  arm_use_neon = true
++}
++
+ config("libpng_public") {
+   include_dirs = [ "." ]
+ }
+@@ -30,7 +34,7 @@ source_set("libpng") {
+     "pngwutil.c",
+   ]
+ 
+-  if (current_cpu == "arm" || current_cpu == "arm64") {
++  if ((current_cpu == "arm" && arm_use_neon) || current_cpu == "arm64") {
+     sources += [
+       "arm/arm_init.c",
+       "arm/filter_neon.S",
+-- 
+2.40.1
+

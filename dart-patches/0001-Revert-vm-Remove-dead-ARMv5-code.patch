@@ -1,0 +1,59 @@
+From c47941397576ddd57d20ac70079235bf0b34c225 Mon Sep 17 00:00:00 2001
+From: Hannes Winkler <hanneswinkler2000@web.de>
+Date: Thu, 7 Mar 2024 13:28:36 +0100
+Subject: [PATCH 1/8] Revert "[vm] Remove dead ARMv5 code."
+
+This reverts commit df54b81dd1c7d150f09720e654801faff5a76275.
+---
+ runtime/vm/cpu_arm.cc | 1 +
+ runtime/vm/cpu_arm.h  | 8 ++++++++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/runtime/vm/cpu_arm.cc b/runtime/vm/cpu_arm.cc
+index 1c63d1bc377..12bebc5d98b 100644
+--- a/runtime/vm/cpu_arm.cc
++++ b/runtime/vm/cpu_arm.cc
+@@ -109,6 +109,7 @@ bool HostCPUFeatures::integer_division_supported_ = false;
+ bool HostCPUFeatures::neon_supported_ = false;
+ bool HostCPUFeatures::hardfp_supported_ = false;
+ const char* HostCPUFeatures::hardware_ = nullptr;
++intptr_t HostCPUFeatures::store_pc_read_offset_ = 8;
+ #if defined(DEBUG)
+ bool HostCPUFeatures::initialized_ = false;
+ #endif
+diff --git a/runtime/vm/cpu_arm.h b/runtime/vm/cpu_arm.h
+index 249192269b6..a6cb9d7675d 100644
+--- a/runtime/vm/cpu_arm.h
++++ b/runtime/vm/cpu_arm.h
+@@ -43,6 +43,10 @@ class HostCPUFeatures : public AllStatic {
+     DEBUG_ASSERT(initialized_);
+     return hardfp_supported_;
+   }
++  static intptr_t store_pc_read_offset() {
++    DEBUG_ASSERT(initialized_);
++    return store_pc_read_offset_;
++  }
+ 
+ #if !defined(HOST_ARCH_ARM)
+   static void set_integer_division_supported(bool supported) {
+@@ -60,6 +64,7 @@ class HostCPUFeatures : public AllStatic {
+   static bool integer_division_supported_;
+   static bool neon_supported_;
+   static bool hardfp_supported_;
++  static intptr_t store_pc_read_offset_;
+ #if defined(DEBUG)
+   static bool initialized_;
+ #endif
+@@ -76,6 +81,9 @@ class TargetCPUFeatures : public AllStatic {
+   static bool neon_supported() { return HostCPUFeatures::neon_supported(); }
+   static bool hardfp_supported() { return HostCPUFeatures::hardfp_supported(); }
+   static const char* hardware() { return HostCPUFeatures::hardware(); }
++  static intptr_t store_pc_read_offset() {
++    return HostCPUFeatures::store_pc_read_offset();
++  }
+ };
+ 
+ }  // namespace dart
+-- 
+2.40.1
+

@@ -1,0 +1,31 @@
+From 665da73139cf99e746ac9ad1f4cef47b793f47eb Mon Sep 17 00:00:00 2001
+From: Hannes Winkler <hanneswinkler2000@web.de>
+Date: Tue, 7 May 2024 17:18:05 +0200
+Subject: [PATCH 3/3] remove freetype2 dependency
+
+Seems like it's not necessary, and it's not present in the pi
+sysroot.
+---
+ build/config/linux/BUILD.gn | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/build/config/linux/BUILD.gn b/build/config/linux/BUILD.gn
+index b3ca187..734510a 100644
+--- a/build/config/linux/BUILD.gn
++++ b/build/config/linux/BUILD.gn
+@@ -27,9 +27,9 @@ config("fontconfig") {
+   libs = [ "fontconfig" ]
+ }
+ 
+-pkg_config("freetype2") {
+-  packages = [ "freetype2" ]
+-}
++#pkg_config("freetype2") {
++#  packages = [ "freetype2" ]
++#}
+ 
+ config("x11") {
+   libs = [
+-- 
+2.40.1
+

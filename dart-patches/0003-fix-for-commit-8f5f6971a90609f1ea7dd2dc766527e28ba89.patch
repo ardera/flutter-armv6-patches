@@ -1,0 +1,28 @@
+From 88a012eb3bac332ef8698262e6322820149aebb9 Mon Sep 17 00:00:00 2001
+From: Hannes Winkler <hanneswinkler2000@web.de>
+Date: Thu, 7 Mar 2024 13:45:14 +0100
+Subject: [PATCH 3/8] fix for commit 8f5f6971a90609f1ea7dd2dc766527e28ba89475
+
+---
+ runtime/vm/compiler/assembler/assembler_arm.cc | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/vm/compiler/assembler/assembler_arm.cc b/runtime/vm/compiler/assembler/assembler_arm.cc
+index d76e2da1dd7..d1c9f1f8f60 100644
+--- a/runtime/vm/compiler/assembler/assembler_arm.cc
++++ b/runtime/vm/compiler/assembler/assembler_arm.cc
+@@ -2960,9 +2960,8 @@ void Assembler::LoadDecodableImmediate(Register rd,
+   const ARMVersion version = TargetCPUFeatures::arm_version();
+   if (version == ARMv6) {
+     if (constant_pool_allowed()) {
+-      const int32_t offset =
+-          target::ObjectPool::element_offset(FindImmediate(value));
+-      LoadWordFromPoolOffset(rd, offset - kHeapObjectTag, PP, cond);
++      const int32_t index = object_pool_builder().FindImmediate(value);
++      LoadWordFromPoolIndex(rd, index, PP, cond);
+     } else {
+       LoadPatchableImmediate(rd, value, cond);
+     }
+-- 
+2.40.1
+

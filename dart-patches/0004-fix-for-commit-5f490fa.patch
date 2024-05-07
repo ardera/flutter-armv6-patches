@@ -1,0 +1,25 @@
+From 34b2da44e9710b4a89844d7e2b9c4901d4d0e104 Mon Sep 17 00:00:00 2001
+From: Hannes Winkler <hanneswinkler2000@web.de>
+Date: Thu, 7 Mar 2024 13:52:12 +0100
+Subject: [PATCH 4/8] fix for commit 5f490fa
+
+---
+ runtime/vm/compiler/assembler/assembler_arm.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/runtime/vm/compiler/assembler/assembler_arm.cc b/runtime/vm/compiler/assembler/assembler_arm.cc
+index d1c9f1f8f60..21fda793506 100644
+--- a/runtime/vm/compiler/assembler/assembler_arm.cc
++++ b/runtime/vm/compiler/assembler/assembler_arm.cc
+@@ -2349,7 +2349,7 @@ void Assembler::BindARMv6(Label* label) {
+       label->position_ = Assembler::DecodeBranchOffset(next);
+     }
+   }
+-  label->BindTo(bound_pc);
++  label->BindTo(bound_pc, lr_state());
+ }
+ 
+ void Assembler::BindARMv7(Label* label) {
+-- 
+2.40.1
+

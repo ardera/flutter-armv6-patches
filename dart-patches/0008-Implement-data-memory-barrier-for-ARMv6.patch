@@ -1,0 +1,121 @@
+From a1a8283ec1c767bae8424bf74937fe335ac1fc40 Mon Sep 17 00:00:00 2001
+From: Hannes Winkler <hanneswinkler2000@web.de>
+Date: Tue, 7 May 2024 17:01:27 +0200
+Subject: [PATCH 8/8] Implement data-memory-barrier for ARMv6
+
+ARMv6 has no dedicated `dmb ish` instruction. Instead, we
+need to write some value to the System Coprocessor.
+
+We do that with `mcr p15, #0, rd, c7, c10, #5`.
+
+Interestingly, the magic bit-shift/length numbers for the
+instruction encoding are already there because of:
+
+https://github.com/dart-lang/sdk/commit/c9c0881ac7c4c83a7024285dd7bd0d0bc584fe13
+---
+ .../vm/compiler/assembler/assembler_arm.cc    | 30 +++++++++++++++++++
+ runtime/vm/compiler/assembler/assembler_arm.h | 28 +++++++++++++++--
+ 2 files changed, 55 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/vm/compiler/assembler/assembler_arm.cc b/runtime/vm/compiler/assembler/assembler_arm.cc
+index da45aca1259..61eda449910 100644
+--- a/runtime/vm/compiler/assembler/assembler_arm.cc
++++ b/runtime/vm/compiler/assembler/assembler_arm.cc
+@@ -529,10 +529,40 @@ void Assembler::strex(Register rd, Register rt, Register rn, Condition cond) {
+ }
+ 
+ void Assembler::dmb() {
++  ASSERT(TargetCPUFeatures::arm_version() == ARMv7);
++  
+   // Emit a `dmb ish` instruction.
+   Emit(kDataMemoryBarrier);
+ }
+ 
++void Assembler::mcr(Register rd, int32_t coproc, int32_t opc1, int32_t crn, int32_t crm, int32_t opc2, Condition cond) {
++  ASSERT(rd != kNoRegister);
++  ASSERT(rd != R15);
++  ASSERT(cond != kNoCondition);
++
++  ASSERT(coproc == 15);
++  ASSERT(opc1 == 0);
++  ASSERT(crn == 7);
++  ASSERT(crm == 10);
++  ASSERT(opc2 == 5);
++
++  int32_t encoded = (static_cast<int32_t>(cond) << kConditionShift) |
++                    B27 | B26 | B25 |
++                    ((opc1 & 0x7) << kOpc1Shift) |
++                    ((crn & 0xf) << kCRnShift) |
++                    (static_cast<int32_t>(rd) << kRdShift) |
++                    ((coproc & 0xf) << kCoprocShift) |
++                    ((opc2 & 0x7) << kOpc2Shift) |
++                    B4 |
++                    ((crm & 0xf) << kCRmShift);
++  Emit(encoded);
++}
++
++void Assembler::mcrDataMemoryBarrier(Register rd, Condition cond) {
++  //  mcr     p15, #0, rd, c7, c10, #5
++  mcr(rd, 15, 0, 7, 10, 5, cond);
++}
++
+ static int32_t BitFieldExtractEncoding(bool sign_extend,
+                                        Register rd,
+                                        Register rn,
+diff --git a/runtime/vm/compiler/assembler/assembler_arm.h b/runtime/vm/compiler/assembler/assembler_arm.h
+index ca5a6326578..c6a2ac97361 100644
+--- a/runtime/vm/compiler/assembler/assembler_arm.h
++++ b/runtime/vm/compiler/assembler/assembler_arm.h
+@@ -438,17 +438,36 @@ class Assembler : public AssemblerBase {
+                    int32_t offset = 0,
+                    OperandSize size = kFourBytes) override {
+     LoadFromOffset(dst, Address(address, offset), size);
+-    dmb();
++    if (TargetCPUFeatures::arm_version() == ARMv7) {
++      dmb();
++    } else {
++      ASSERT(TargetCPUFeatures::arm_version() == ARMv6);
++      ASSERT(dst != TMP);
++      ASSERT(address != TMP);
++
++      mov(TMP, Operand(0));
++      mcrDataMemoryBarrier(TMP);
++    }
+   }
+   void StoreRelease(Register src,
+                     Register address,
+                     int32_t offset = 0) override {
+     StoreRelease(src, Address(address, offset));
+   }
++
+   void StoreRelease(Register src, Address dest) {
+-    dmb();
+-    StoreToOffset(src, dest);
++    if (TargetCPUFeatures::arm_version() == ARMv7) {
++      dmb();
++    } else {
++      ASSERT(TargetCPUFeatures::arm_version() == ARMv6);
++      ASSERT(src != TMP);
++      ASSERT(dest.base() != TMP);
++
++      mov(TMP, Operand(0));
++      mcrDataMemoryBarrier(TMP);
++    }
+ 
++    StoreToOffset(src, dest);
+     // We don't run TSAN bots on 32 bit.
+   }
+ 
+@@ -614,6 +633,9 @@ class Assembler : public AssemblerBase {
+   void strex(Register rd, Register rt, Register rn, Condition cond = AL);
+ 
+   void dmb();
++  
++  void mcr(Register rd, int32_t coproc, int32_t opc1, int32_t crn, int32_t crm, int32_t opc2, Condition cond = AL);
++  void mcrDataMemoryBarrier(Register rd, Condition cond = AL);
+ 
+   // Media instructions. ARMv7 only
+   void sbfx(Register rd,
+-- 
+2.40.1
+

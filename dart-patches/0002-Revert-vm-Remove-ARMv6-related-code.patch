@@ -1,0 +1,840 @@
+From b1a43adad1d34b8a36edc3df11b5a0c029280c87 Mon Sep 17 00:00:00 2001
+From: Hannes Winkler <hanneswinkler2000@web.de>
+Date: Thu, 7 Mar 2024 13:34:37 +0100
+Subject: [PATCH 2/8] Revert "[vm] Remove ARMv6 related code"
+
+This reverts commit 53807c1d791dbc0746233cbd2c27e6ace4e43f57.
+---
+ runtime/BUILD.gn                              |   3 +
+ .../vm/compiler/assembler/assembler_arm.cc    | 200 ++++++++++++++++--
+ runtime/vm/compiler/assembler/assembler_arm.h |   1 +
+ .../compiler/assembler/assembler_arm_test.cc  |  10 +
+ .../vm/compiler/assembler/disassembler_arm.cc |  16 +-
+ runtime/vm/compiler/backend/il_arm.cc         |   3 +-
+ .../compiler/ffi/native_calling_convention.cc |   1 +
+ runtime/vm/cpu_arm.cc                         |  48 ++++-
+ runtime/vm/cpu_arm.h                          |  16 ++
+ runtime/vm/instructions_arm.cc                |  50 ++++-
+ runtime/vm/profiler.cc                        |   7 +
+ runtime/vm/regexp_assembler_ir.cc             |  12 +-
+ runtime/vm/simulator_arm.cc                   |  86 ++++++--
+ 13 files changed, 407 insertions(+), 46 deletions(-)
+
+diff --git a/runtime/BUILD.gn b/runtime/BUILD.gn
+index 321f4986a09..4542d5de202 100644
+--- a/runtime/BUILD.gn
++++ b/runtime/BUILD.gn
+@@ -135,6 +135,9 @@ config("dart_arch_config") {
+ 
+   if (dart_target_arch == "arm") {
+     defines += [ "TARGET_ARCH_ARM" ]
++  } else if (dart_target_arch == "armv6") {
++    defines += [ "TARGET_ARCH_ARM" ]
++    defines += [ "TARGET_ARCH_ARM_6" ]
+   } else if (dart_target_arch == "arm64") {
+     defines += [ "TARGET_ARCH_ARM64" ]
+   } else if (dart_target_arch == "x64") {
+diff --git a/runtime/vm/compiler/assembler/assembler_arm.cc b/runtime/vm/compiler/assembler/assembler_arm.cc
+index b731fa98910..d76e2da1dd7 100644
+--- a/runtime/vm/compiler/assembler/assembler_arm.cc
++++ b/runtime/vm/compiler/assembler/assembler_arm.cc
+@@ -363,8 +363,13 @@ void Assembler::mls(Register rd,
+                     Register ra,
+                     Condition cond) {
+   // rd <- ra - rn * rm.
+-  // Assembler registers rd, rn, rm, ra are encoded as rn, rm, rs, rd.
+-  EmitMulOp(cond, B22 | B21, ra, rd, rn, rm);
++  if (TargetCPUFeatures::arm_version() == ARMv7) {
++    // Assembler registers rd, rn, rm, ra are encoded as rn, rm, rs, rd.
++    EmitMulOp(cond, B22 | B21, ra, rd, rn, rm);
++  } else {
++    mul(IP, rn, rm, cond);
++    sub(rd, ra, Operand(IP), cond);
++  }
+ }
+ 
+ void Assembler::smull(Register rd_lo,
+@@ -1008,6 +1013,9 @@ void Assembler::vmovd(DRegister dd, DRegister dm, Condition cond) {
+ }
+ 
+ bool Assembler::vmovs(SRegister sd, float s_imm, Condition cond) {
++  if (TargetCPUFeatures::arm_version() != ARMv7) {
++    return false;
++  }
+   uint32_t imm32 = bit_cast<uint32_t, float>(s_imm);
+   if (((imm32 & ((1 << 19) - 1)) == 0) &&
+       ((((imm32 >> 25) & ((1 << 6) - 1)) == (1 << 5)) ||
+@@ -1022,6 +1030,9 @@ bool Assembler::vmovs(SRegister sd, float s_imm, Condition cond) {
+ }
+ 
+ bool Assembler::vmovd(DRegister dd, double d_imm, Condition cond) {
++  if (TargetCPUFeatures::arm_version() != ARMv7) {
++    return false;
++  }
+   uint64_t imm64 = bit_cast<uint64_t, double>(d_imm);
+   if (((imm64 & ((1LL << 48) - 1)) == 0) &&
+       ((((imm64 >> 54) & ((1 << 9) - 1)) == (1 << 8)) ||
+@@ -2137,15 +2148,69 @@ static int32_t DecodeARMv7LoadImmediate(int32_t movt, int32_t movw) {
+   return offset;
+ }
+ 
++static int32_t DecodeARMv6LoadImmediate(int32_t mov,
++                                        int32_t or1,
++                                        int32_t or2,
++                                        int32_t or3) {
++  int32_t offset = 0;
++  offset |= (mov & 0xff) << 24;
++  offset |= (or1 & 0xff) << 16;
++  offset |= (or2 & 0xff) << 8;
++  offset |= (or3 & 0xff);
++  return offset;
++}
++
+ class PatchFarBranch : public AssemblerFixup {
+  public:
+   PatchFarBranch() {}
+ 
+   void Process(const MemoryRegion& region, intptr_t position) {
+-    ProcessARMv7(region, position);
++    const ARMVersion version = TargetCPUFeatures::arm_version();
++    if (version == ARMv6) {
++      ProcessARMv6(region, position);
++    } else {
++      ASSERT(version == ARMv7);
++      ProcessARMv7(region, position);
++    }
+   }
+ 
+  private:
++  void ProcessARMv6(const MemoryRegion& region, intptr_t position) {
++    const int32_t mov = region.Load<int32_t>(position);
++    const int32_t or1 = region.Load<int32_t>(position + 1 * Instr::kInstrSize);
++    const int32_t or2 = region.Load<int32_t>(position + 2 * Instr::kInstrSize);
++    const int32_t or3 = region.Load<int32_t>(position + 3 * Instr::kInstrSize);
++    const int32_t bx = region.Load<int32_t>(position + 4 * Instr::kInstrSize);
++
++    if (((mov & 0xffffff00) == 0xe3a0c400) &&  // mov IP, (byte3 rot 4)
++        ((or1 & 0xffffff00) == 0xe38cc800) &&  // orr IP, IP, (byte2 rot 8)
++        ((or2 & 0xffffff00) == 0xe38ccc00) &&  // orr IP, IP, (byte1 rot 12)
++        ((or3 & 0xffffff00) == 0xe38cc000)) {  // orr IP, IP, byte0
++      const int32_t offset = DecodeARMv6LoadImmediate(mov, or1, or2, or3);
++      const int32_t dest = region.start() + offset;
++      const int32_t dest0 = (dest & 0x000000ff);
++      const int32_t dest1 = (dest & 0x0000ff00) >> 8;
++      const int32_t dest2 = (dest & 0x00ff0000) >> 16;
++      const int32_t dest3 = (dest & 0xff000000) >> 24;
++      const int32_t patched_mov = 0xe3a0c400 | dest3;
++      const int32_t patched_or1 = 0xe38cc800 | dest2;
++      const int32_t patched_or2 = 0xe38ccc00 | dest1;
++      const int32_t patched_or3 = 0xe38cc000 | dest0;
++
++      region.Store<int32_t>(position + 0 * Instr::kInstrSize, patched_mov);
++      region.Store<int32_t>(position + 1 * Instr::kInstrSize, patched_or1);
++      region.Store<int32_t>(position + 2 * Instr::kInstrSize, patched_or2);
++      region.Store<int32_t>(position + 3 * Instr::kInstrSize, patched_or3);
++      return;
++    }
++
++    // If the offset loading instructions aren't there, we must have replaced
++    // the far branch with a near one, and so these instructions
++    // should be NOPs.
++    ASSERT((or1 == Instr::kNopInstruction) && (or2 == Instr::kNopInstruction) &&
++           (or3 == Instr::kNopInstruction) && (bx == Instr::kNopInstruction));
++  }
++
+   void ProcessARMv7(const MemoryRegion& region, intptr_t position) {
+     const int32_t movw = region.Load<int32_t>(position);
+     const int32_t movt = region.Load<int32_t>(position + Instr::kInstrSize);
+@@ -2208,6 +2273,85 @@ void Assembler::EmitBranch(Condition cond, Label* label, bool link) {
+   }
+ }
+ 
++void Assembler::BindARMv6(Label* label) {
++  ASSERT(!label->IsBound());
++  intptr_t bound_pc = buffer_.Size();
++  while (label->IsLinked()) {
++    const int32_t position = label->Position();
++    int32_t dest = bound_pc - position;
++    if (use_far_branches() && !CanEncodeBranchDistance(dest)) {
++      // Far branches are enabled and we can't encode the branch offset.
++
++      // Grab instructions that load the offset.
++      const int32_t mov = buffer_.Load<int32_t>(position);
++      const int32_t or1 =
++          buffer_.Load<int32_t>(position + 1 * Instr::kInstrSize);
++      const int32_t or2 =
++          buffer_.Load<int32_t>(position + 2 * Instr::kInstrSize);
++      const int32_t or3 =
++          buffer_.Load<int32_t>(position + 3 * Instr::kInstrSize);
++
++      // Change from relative to the branch to relative to the assembler
++      // buffer.
++      dest = buffer_.Size();
++      const int32_t dest0 = (dest & 0x000000ff);
++      const int32_t dest1 = (dest & 0x0000ff00) >> 8;
++      const int32_t dest2 = (dest & 0x00ff0000) >> 16;
++      const int32_t dest3 = (dest & 0xff000000) >> 24;
++      const int32_t patched_mov = 0xe3a0c400 | dest3;
++      const int32_t patched_or1 = 0xe38cc800 | dest2;
++      const int32_t patched_or2 = 0xe38ccc00 | dest1;
++      const int32_t patched_or3 = 0xe38cc000 | dest0;
++
++      // Rewrite the instructions.
++      buffer_.Store<int32_t>(position + 0 * Instr::kInstrSize, patched_mov);
++      buffer_.Store<int32_t>(position + 1 * Instr::kInstrSize, patched_or1);
++      buffer_.Store<int32_t>(position + 2 * Instr::kInstrSize, patched_or2);
++      buffer_.Store<int32_t>(position + 3 * Instr::kInstrSize, patched_or3);
++      label->position_ = DecodeARMv6LoadImmediate(mov, or1, or2, or3);
++    } else if (use_far_branches() && CanEncodeBranchDistance(dest)) {
++      // Grab instructions that load the offset, and the branch.
++      const int32_t mov = buffer_.Load<int32_t>(position);
++      const int32_t or1 =
++          buffer_.Load<int32_t>(position + 1 * Instr::kInstrSize);
++      const int32_t or2 =
++          buffer_.Load<int32_t>(position + 2 * Instr::kInstrSize);
++      const int32_t or3 =
++          buffer_.Load<int32_t>(position + 3 * Instr::kInstrSize);
++      const int32_t branch =
++          buffer_.Load<int32_t>(position + 4 * Instr::kInstrSize);
++
++      // Grab the branch condition, and encode the link bit.
++      const int32_t cond = branch & 0xf0000000;
++      const int32_t link = (branch & 0x20) << 19;
++
++      // Encode the branch and the offset.
++      const int32_t new_branch = cond | link | 0x0a000000;
++      const int32_t encoded = EncodeBranchOffset(dest, new_branch);
++
++      // Write the encoded branch instruction followed by two nops.
++      buffer_.Store<int32_t>(position, encoded);
++      buffer_.Store<int32_t>(position + 1 * Instr::kInstrSize,
++                             Instr::kNopInstruction);
++      buffer_.Store<int32_t>(position + 2 * Instr::kInstrSize,
++                             Instr::kNopInstruction);
++      buffer_.Store<int32_t>(position + 3 * Instr::kInstrSize,
++                             Instr::kNopInstruction);
++      buffer_.Store<int32_t>(position + 4 * Instr::kInstrSize,
++                             Instr::kNopInstruction);
++
++      label->position_ = DecodeARMv6LoadImmediate(mov, or1, or2, or3);
++    } else {
++      BailoutIfInvalidBranchOffset(dest);
++      int32_t next = buffer_.Load<int32_t>(position);
++      int32_t encoded = Assembler::EncodeBranchOffset(dest, next);
++      buffer_.Store<int32_t>(position, encoded);
++      label->position_ = Assembler::DecodeBranchOffset(next);
++    }
++  }
++  label->BindTo(bound_pc);
++}
++
+ void Assembler::BindARMv7(Label* label) {
+   ASSERT(!label->IsBound());
+   intptr_t bound_pc = buffer_.Size();
+@@ -2276,7 +2420,13 @@ void Assembler::BindARMv7(Label* label) {
+ }
+ 
+ void Assembler::Bind(Label* label) {
+-  BindARMv7(label);
++  const ARMVersion version = TargetCPUFeatures::arm_version();
++  if (version == ARMv6) {
++    BindARMv6(label);
++  } else {
++    ASSERT(version == ARMv7);
++    BindARMv7(label);
++  }
+ }
+ 
+ void Assembler::LoadCompressedSmi(Register dest, const Address& slot) {
+@@ -2784,19 +2934,45 @@ void Assembler::BranchLinkOffset(Register base, int32_t offset) {
+ void Assembler::LoadPatchableImmediate(Register rd,
+                                        int32_t value,
+                                        Condition cond) {
+-  const uint16_t value_low = Utils::Low16Bits(value);
+-  const uint16_t value_high = Utils::High16Bits(value);
+-  movw(rd, value_low, cond);
+-  movt(rd, value_high, cond);
++  const ARMVersion version = TargetCPUFeatures::arm_version();
++  if (version == ARMv6) {
++    // This sequence is patched in a few places, and should remain fixed.
++    const uint32_t byte0 = (value & 0x000000ff);
++    const uint32_t byte1 = (value & 0x0000ff00) >> 8;
++    const uint32_t byte2 = (value & 0x00ff0000) >> 16;
++    const uint32_t byte3 = (value & 0xff000000) >> 24;
++    mov(rd, Operand(4, byte3), cond);
++    orr(rd, rd, Operand(8, byte2), cond);
++    orr(rd, rd, Operand(12, byte1), cond);
++    orr(rd, rd, Operand(byte0), cond);
++  } else {
++    ASSERT(version == ARMv7);
++    const uint16_t value_low = Utils::Low16Bits(value);
++    const uint16_t value_high = Utils::High16Bits(value);
++    movw(rd, value_low, cond);
++    movt(rd, value_high, cond);
++  }
+ }
+ 
+ void Assembler::LoadDecodableImmediate(Register rd,
+                                        int32_t value,
+                                        Condition cond) {
+-  movw(rd, Utils::Low16Bits(value), cond);
+-  const uint16_t value_high = Utils::High16Bits(value);
+-  if (value_high != 0) {
+-    movt(rd, value_high, cond);
++  const ARMVersion version = TargetCPUFeatures::arm_version();
++  if (version == ARMv6) {
++    if (constant_pool_allowed()) {
++      const int32_t offset =
++          target::ObjectPool::element_offset(FindImmediate(value));
++      LoadWordFromPoolOffset(rd, offset - kHeapObjectTag, PP, cond);
++    } else {
++      LoadPatchableImmediate(rd, value, cond);
++    }
++  } else {
++    ASSERT(version == ARMv7);
++    movw(rd, Utils::Low16Bits(value), cond);
++    const uint16_t value_high = Utils::High16Bits(value);
++    if (value_high != 0) {
++      movt(rd, value_high, cond);
++    }
+   }
+ }
+ 
+diff --git a/runtime/vm/compiler/assembler/assembler_arm.h b/runtime/vm/compiler/assembler/assembler_arm.h
+index 63302cc584a..938b8aee2bf 100644
+--- a/runtime/vm/compiler/assembler/assembler_arm.h
++++ b/runtime/vm/compiler/assembler/assembler_arm.h
+@@ -1672,6 +1672,7 @@ class Assembler : public AssemblerBase {
+   void movw(Register rd, uint16_t imm16, Condition cond = AL);
+   void movt(Register rd, uint16_t imm16, Condition cond = AL);
+ 
++  void BindARMv6(Label* label);
+   void BindARMv7(Label* label);
+ 
+   void BranchLink(const ExternalLabel* label);
+diff --git a/runtime/vm/compiler/assembler/assembler_arm_test.cc b/runtime/vm/compiler/assembler/assembler_arm_test.cc
+index 55dfe6a1d7f..8fe0504601a 100644
+--- a/runtime/vm/compiler/assembler/assembler_arm_test.cc
++++ b/runtime/vm/compiler/assembler/assembler_arm_test.cc
+@@ -102,8 +102,18 @@ ASSEMBLER_TEST_RUN(MoveRotImm, test) {
+ }
+ 
+ ASSEMBLER_TEST_GENERATE(MovImm16, assembler) {
++#if defined(USING_SIMULATOR)
++  // ARMv7 is the default.
++  HostCPUFeatures::set_arm_version(ARMv6);
++  __ LoadPatchableImmediate(R0, 0x12345678 << 1);
++  HostCPUFeatures::set_arm_version(ARMv7);
++  __ LoadPatchableImmediate(R1, 0x12345678);
++  __ sub(R0, R0, Operand(R1));
++  __ bx(LR);
++#else
+   __ LoadPatchableImmediate(R0, 0x12345678);
+   __ Ret();
++#endif
+ }
+ 
+ ASSEMBLER_TEST_RUN(MovImm16, test) {
+diff --git a/runtime/vm/compiler/assembler/disassembler_arm.cc b/runtime/vm/compiler/assembler/disassembler_arm.cc
+index 3654dbe1940..d254e243332 100644
+--- a/runtime/vm/compiler/assembler/disassembler_arm.cc
++++ b/runtime/vm/compiler/assembler/disassembler_arm.cc
+@@ -700,6 +700,10 @@ void ARMDecoder::DecodeType01(Instr* instr) {
+             break;
+           }
+           case 3: {
++            if (TargetCPUFeatures::arm_version() != ARMv7) {
++              Unknown(instr);
++              return;
++            }
+             // Assembler registers rd, rn, rm, ra are encoded as rn, rm, rs, rd.
+             Format(instr, "mls'cond's 'rn, 'rm, 'rs, 'rd");
+             break;
+@@ -745,7 +749,11 @@ void ARMDecoder::DecodeType01(Instr* instr) {
+       // 16-bit immediate loads, msr (immediate), and hints
+       switch (instr->Bits(20, 5)) {
+         case 16: {
+-          Format(instr, "movw'cond 'rd, #'imm4_12");
++          if (TargetCPUFeatures::arm_version() == ARMv7) {
++            Format(instr, "movw'cond 'rd, #'imm4_12");
++          } else {
++            Unknown(instr);
++          }
+           break;
+         }
+         case 18: {
+@@ -757,7 +765,11 @@ void ARMDecoder::DecodeType01(Instr* instr) {
+           break;
+         }
+         case 20: {
+-          Format(instr, "movt'cond 'rd, #'imm4_12");
++          if (TargetCPUFeatures::arm_version() == ARMv7) {
++            Format(instr, "movt'cond 'rd, #'imm4_12");
++          } else {
++            Unknown(instr);
++          }
+           break;
+         }
+         default: {
+diff --git a/runtime/vm/compiler/backend/il_arm.cc b/runtime/vm/compiler/backend/il_arm.cc
+index 5159e29f07e..f4b1bfa7749 100644
+--- a/runtime/vm/compiler/backend/il_arm.cc
++++ b/runtime/vm/compiler/backend/il_arm.cc
+@@ -2911,7 +2911,7 @@ LocationSummary* LoadCodeUnitsInstr::MakeLocationSummary(Zone* zone,
+                                                          bool opt) const {
+   const bool might_box = (representation() == kTagged) && !can_pack_into_smi();
+   const intptr_t kNumInputs = 2;
+-  const intptr_t kNumTemps = might_box ? 2 : 0;
++  const intptr_t kNumTemps = might_box ? 1 : 0;
+   LocationSummary* summary = new (zone) LocationSummary(
+       zone, kNumInputs, kNumTemps,
+       might_box ? LocationSummary::kCallOnSlowPath : LocationSummary::kNoCall);
+@@ -2920,7 +2920,6 @@ LocationSummary* LoadCodeUnitsInstr::MakeLocationSummary(Zone* zone,
+ 
+   if (might_box) {
+     summary->set_temp(0, Location::RequiresRegister());
+-    summary->set_temp(1, Location::RequiresRegister());
+   }
+ 
+   if (representation() == kUnboxedInt64) {
+diff --git a/runtime/vm/compiler/ffi/native_calling_convention.cc b/runtime/vm/compiler/ffi/native_calling_convention.cc
+index 7195514fbbd..f46697de83f 100644
+--- a/runtime/vm/compiler/ffi/native_calling_convention.cc
++++ b/runtime/vm/compiler/ffi/native_calling_convention.cc
+@@ -678,6 +678,7 @@ class ArgumentAllocator : public ValueObject {
+   // > Procedure Call Standard is used. In this variant, floating-point
+   // > (and vector) arguments are passed in general purpose registers
+   // > (GPRs) instead of in VFP registers)
++  // https://developer.apple.com/library/archive/documentation/Xcode/Conceptual/iPhoneOSABIReference/Articles/ARMv6FunctionCallingConventions.html#//apple_ref/doc/uid/TP40009021-SW1
+   // https://developer.apple.com/library/archive/documentation/Xcode/Conceptual/iPhoneOSABIReference/Articles/ARMv7FunctionCallingConventions.html#//apple_ref/doc/uid/TP40009022-SW1
+   void BlockAllFpuRegisters() {
+     // Set all bits to 1.
+diff --git a/runtime/vm/cpu_arm.cc b/runtime/vm/cpu_arm.cc
+index 12bebc5d98b..1bb358b5b0d 100644
+--- a/runtime/vm/cpu_arm.cc
++++ b/runtime/vm/cpu_arm.cc
+@@ -23,7 +23,8 @@
+ #endif
+ 
+ // ARM version differences.
+-// We support only ARMv7 and variants. We detect the presence of vfp,
++// We support two major 32-bit ARM ISA versions: ARMv6 and variants,
++// and ARMv7 and variants. For each of these we detect the presence of vfp,
+ // neon, and integer division instructions. Considering ARMv5TE as the baseline,
+ // later versions add the following features/instructions that we use:
+ //
+@@ -39,20 +40,35 @@
+ //
+ // If an aarch64 CPU is detected, we generate ARMv7 code.
+ //
++// If an instruction is missing on ARMv6, we emulate it, if possible.
+ // Where we are missing vfp, we do not unbox doubles, or generate intrinsics for
+ // floating point operations. Where we are missing neon, we do not unbox SIMD
+ // values, or inline operations on SIMD values. Where we are missing integer
+ // division, we do not inline division operations, and we do not generate
+ // intrinsics that do division. See the feature tests in flow_graph_optimizer.cc
+ // for details.
++//
++// Alignment:
++//
++// On ARMv6 and on, we assume that the kernel is set up to fixup unaligned
++// accesses. This can be verified by checking /proc/cpu/alignment on modern
++// Linux systems.
+ 
+ namespace dart {
+ 
++#if defined(TARGET_ARCH_ARM_6)
++DEFINE_FLAG(bool, use_neon, false, "Use neon instructions if supported");
++DEFINE_FLAG(bool,
++            use_integer_division,
++            false,
++            "Use integer division instruction if supported");
++#else
+ DEFINE_FLAG(bool, use_neon, true, "Use neon instructions if supported");
+ DEFINE_FLAG(bool,
+             use_integer_division,
+             true,
+             "Use integer division instruction if supported");
++#endif
+ 
+ #if defined(TARGET_HOST_MISMATCH)
+ #if defined(DART_TARGET_OS_ANDROID) || defined(DART_TARGET_OS_MACOS_IOS)
+@@ -109,6 +125,7 @@ bool HostCPUFeatures::integer_division_supported_ = false;
+ bool HostCPUFeatures::neon_supported_ = false;
+ bool HostCPUFeatures::hardfp_supported_ = false;
+ const char* HostCPUFeatures::hardware_ = nullptr;
++ARMVersion HostCPUFeatures::arm_version_ = ARMvUnknown;
+ intptr_t HostCPUFeatures::store_pc_read_offset_ = 8;
+ #if defined(DEBUG)
+ bool HostCPUFeatures::initialized_ = false;
+@@ -122,6 +139,9 @@ void HostCPUFeatures::Init() {
+   hardware_ = "";
+   // When the VM is targetted to ARMv7, pretend that the CPU is ARMv7 even if
+   // the CPU is actually AArch64.
++  arm_version_ = ARMv7;
++  // Always assume we have floating point unit since we don't support ARMv6 in
++  // this path.
+   integer_division_supported_ = FLAG_use_integer_division;
+   neon_supported_ = FLAG_use_neon;
+   hardfp_supported_ = false;
+@@ -160,12 +180,24 @@ void HostCPUFeatures::Init() {
+                      strstr(uname_.machine, "arm64") != nullptr ||
+                      strstr(uname_.machine, "armv8") != nullptr))) {
+     // pretend that this arm64 cpu is really an ARMv7
++    arm_version_ = ARMv7;
+     is_arm64 = true;
+-  } else if (!CpuInfo::FieldContains(kCpuInfoProcessor, "ARMv7") &&
+-             !CpuInfo::FieldContains(kCpuInfoModel, "ARMv7") &&
+-             !CpuInfo::FieldContains(kCpuInfoArchitecture, "7") &&
+-             !(ret_ == 0 && strstr(uname_.machine, "armv7") != nullptr)) {
++  } else if (CpuInfo::FieldContains(kCpuInfoProcessor, "ARMv6") ||
++             CpuInfo::FieldContains(kCpuInfoModel, "ARMv6") ||
++             !(ret_ == 0 && strstr(uname_.machine, "armv6") != nullptr)) {
++    // Raspberry Pi, etc.
++    arm_version_ = ARMv6;
++  } else if (CpuInfo::FieldContains(kCpuInfoProcessor, "ARMv7") ||
++             CpuInfo::FieldContains(kCpuInfoModel, "ARMv7") ||
++             CpuInfo::FieldContains(kCpuInfoArchitecture, "7") ||
++             (ret_ == 0 && strstr(uname_.machine, "armv7") != nullptr)) {
++    arm_version_ = ARMv7;
++  } else {
++#if defined(DART_RUN_IN_QEMU_ARMv7)
++    arm_version_ = ARMv7;
++#else
+     FATAL("Unrecognized ARM CPU architecture.");
++#endif
+   }
+ 
+   // Has integer division.
+@@ -239,6 +271,12 @@ void HostCPUFeatures::Init() {
+   CpuInfo::Init();
+   hardware_ = CpuInfo::GetCpuModel();
+ 
++#if defined(TARGET_ARCH_ARM_6)
++  arm_version_ = ARMv6;
++#else
++  arm_version_ = ARMv7;
++#endif
++
+   integer_division_supported_ = FLAG_use_integer_division;
+   neon_supported_ = FLAG_use_neon;
+   hardfp_supported_ = FLAG_sim_use_hardfp;
+diff --git a/runtime/vm/cpu_arm.h b/runtime/vm/cpu_arm.h
+index a6cb9d7675d..59d8c5b0b35 100644
+--- a/runtime/vm/cpu_arm.h
++++ b/runtime/vm/cpu_arm.h
+@@ -23,6 +23,12 @@ namespace dart {
+ // additionally mock the options needed for the target architecture so that
+ // they may be altered for testing.
+ 
++enum ARMVersion {
++  ARMv6,
++  ARMv7,
++  ARMvUnknown,
++};
++
+ class HostCPUFeatures : public AllStatic {
+  public:
+   static void Init();
+@@ -43,6 +49,10 @@ class HostCPUFeatures : public AllStatic {
+     DEBUG_ASSERT(initialized_);
+     return hardfp_supported_;
+   }
++  static ARMVersion arm_version() {
++    DEBUG_ASSERT(initialized_);
++    return arm_version_;
++  }
+   static intptr_t store_pc_read_offset() {
+     DEBUG_ASSERT(initialized_);
+     return store_pc_read_offset_;
+@@ -57,6 +67,10 @@ class HostCPUFeatures : public AllStatic {
+     DEBUG_ASSERT(initialized_);
+     neon_supported_ = supported;
+   }
++  static void set_arm_version(ARMVersion version) {
++    DEBUG_ASSERT(initialized_);
++    arm_version_ = version;
++  }
+ #endif  // !defined(HOST_ARCH_ARM)
+ 
+  private:
+@@ -64,6 +78,7 @@ class HostCPUFeatures : public AllStatic {
+   static bool integer_division_supported_;
+   static bool neon_supported_;
+   static bool hardfp_supported_;
++  static ARMVersion arm_version_;
+   static intptr_t store_pc_read_offset_;
+ #if defined(DEBUG)
+   static bool initialized_;
+@@ -81,6 +96,7 @@ class TargetCPUFeatures : public AllStatic {
+   static bool neon_supported() { return HostCPUFeatures::neon_supported(); }
+   static bool hardfp_supported() { return HostCPUFeatures::hardfp_supported(); }
+   static const char* hardware() { return HostCPUFeatures::hardware(); }
++  static ARMVersion arm_version() { return HostCPUFeatures::arm_version(); }
+   static intptr_t store_pc_read_offset() {
+     return HostCPUFeatures::store_pc_read_offset();
+   }
+diff --git a/runtime/vm/instructions_arm.cc b/runtime/vm/instructions_arm.cc
+index 667857b01af..bffde5af188 100644
+--- a/runtime/vm/instructions_arm.cc
++++ b/runtime/vm/instructions_arm.cc
+@@ -100,17 +100,42 @@ uword InstructionPattern::DecodeLoadWordImmediate(uword end,
+   uword start = end - Instr::kInstrSize;
+   int32_t instr = Instr::At(start)->InstructionBits();
+   intptr_t imm = 0;
+-  if ((instr & 0xfff00000) == 0xe3400000) {  // movt reg, #imm_hi
+-    imm |= (instr & 0xf0000) << 12;
+-    imm |= (instr & 0xfff) << 16;
++  const ARMVersion version = TargetCPUFeatures::arm_version();
++  if (version == ARMv6) {
++    ASSERT((instr & 0xfff00000) == 0xe3800000);  // orr rd, rd, byte0
++    imm |= (instr & 0x000000ff);
++
++    start -= Instr::kInstrSize;
++    instr = Instr::At(start)->InstructionBits();
++    ASSERT((instr & 0xfff00000) == 0xe3800c00);  // orr rd, rd, (byte1 rot 12)
++    imm |= (instr & 0x000000ff);
++
++    start -= Instr::kInstrSize;
++    instr = Instr::At(start)->InstructionBits();
++    ASSERT((instr & 0xfff00f00) == 0xe3800800);  // orr rd, rd, (byte2 rot 8)
++    imm |= (instr & 0x000000ff);
++
+     start -= Instr::kInstrSize;
+     instr = Instr::At(start)->InstructionBits();
++    ASSERT((instr & 0xffff0f00) == 0xe3a00400);  // mov rd, (byte3 rot 4)
++    imm |= (instr & 0x000000ff);
++
++    *reg = static_cast<Register>((instr & 0x0000f000) >> 12);
++    *value = imm;
++  } else {
++    ASSERT(version == ARMv7);
++    if ((instr & 0xfff00000) == 0xe3400000) {  // movt reg, #imm_hi
++      imm |= (instr & 0xf0000) << 12;
++      imm |= (instr & 0xfff) << 16;
++      start -= Instr::kInstrSize;
++      instr = Instr::At(start)->InstructionBits();
++    }
++    ASSERT((instr & 0xfff00000) == 0xe3000000);  // movw reg, #imm_lo
++    imm |= (instr & 0xf0000) >> 4;
++    imm |= instr & 0xfff;
++    *reg = static_cast<Register>((instr & 0xf000) >> 12);
++    *value = imm;
+   }
+-  ASSERT((instr & 0xfff00000) == 0xe3000000);  // movw reg, #imm_lo
+-  imm |= (instr & 0xf0000) >> 4;
+-  imm |= instr & 0xfff;
+-  *reg = static_cast<Register>((instr & 0xf000) >> 12);
+-  *value = imm;
+   return start;
+ }
+ 
+@@ -311,7 +336,14 @@ bool ReturnPattern::IsValid() const {
+   int32_t instruction = (static_cast<int32_t>(AL) << kConditionShift) | B24 |
+                         B21 | (0xfff << 8) | B4 |
+                         (LINK_REGISTER.code << kRmShift);
+-  return bx_lr->InstructionBits() == instruction;
++  const ARMVersion version = TargetCPUFeatures::arm_version();
++  if (version == ARMv6) {
++    return bx_lr->InstructionBits() == instruction;
++  } else {
++    ASSERT(version == ARMv7);
++    return bx_lr->InstructionBits() == instruction;
++  }
++  return false;
+ }
+ 
+ bool PcRelativeCallPattern::IsValid() const {
+diff --git a/runtime/vm/profiler.cc b/runtime/vm/profiler.cc
+index 6b64f4d4f5a..a65877b5a01 100644
+--- a/runtime/vm/profiler.cc
++++ b/runtime/vm/profiler.cc
+@@ -36,10 +36,17 @@ static constexpr intptr_t kMaxSamplesPerTick = 4;
+ 
+ DEFINE_FLAG(bool, trace_profiled_isolates, false, "Trace profiled isolates.");
+ 
++#if defined(TARGET_ARCH_ARM_6)
++DEFINE_FLAG(int,
++            profile_period,
++            10000,
++            "Time between profiler samples in microseconds. Minimum 50.");
++#else
+ DEFINE_FLAG(int,
+             profile_period,
+             1000,
+             "Time between profiler samples in microseconds. Minimum 50.");
++#endif
+ DEFINE_FLAG(int,
+             max_profile_depth,
+             Sample::kPCArraySizeInWords* kMaxSamplesPerTick,
+diff --git a/runtime/vm/regexp_assembler_ir.cc b/runtime/vm/regexp_assembler_ir.cc
+index 11c3a2589a5..bb688bf18cd 100644
+--- a/runtime/vm/regexp_assembler_ir.cc
++++ b/runtime/vm/regexp_assembler_ir.cc
+@@ -280,8 +280,18 @@ void IRRegExpMacroAssembler::FinalizeRegistersArray() {
+   num_registers_constant_instr->ReplaceWith(new_constant, /*iterator=*/nullptr);
+ }
+ 
++#if defined(TARGET_ARCH_ARM)
++// Disabling unaligned accesses forces the regexp engine to load characters one
++// by one instead of up to 4 at once, along with the associated performance hit.
++// TODO(zerny): Be less conservative about disabling unaligned accesses.
++// For instance, ARMv6 supports unaligned accesses. Once it is enabled here,
++// update LoadCodeUnitsInstr methods for the appropriate architectures.
++static const bool kEnableUnalignedAccesses = false;
++#else
++static const bool kEnableUnalignedAccesses = true;
++#endif
+ bool IRRegExpMacroAssembler::CanReadUnaligned() {
+-  return !slow_safe();
++  return kEnableUnalignedAccesses && !slow_safe();
+ }
+ 
+ ArrayPtr IRRegExpMacroAssembler::Execute(const RegExp& regexp,
+diff --git a/runtime/vm/simulator_arm.cc b/runtime/vm/simulator_arm.cc
+index adc7a00d6ad..5d813cdb100 100644
+--- a/runtime/vm/simulator_arm.cc
++++ b/runtime/vm/simulator_arm.cc
+@@ -987,6 +987,26 @@ void Simulator::HandleIllegalAccess(uword addr, Instr* instr) {
+   FATAL("Cannot continue execution after illegal memory access.");
+ }
+ 
++// Processor versions prior to ARMv7 could not do unaligned reads and writes.
++// On some ARM platforms an interrupt is caused.  On others it does a funky
++// rotation thing.  However, from version v7, unaligned access is supported.
++// Note that simulator runs have the runtime system running directly on the host
++// system and only generated code is executed in the simulator.  Since the host
++// is typically IA32 we will get the correct ARMv7-like behaviour on unaligned
++// accesses, but we should actually not generate code accessing unaligned data,
++// so we still want to know and abort if we encounter such code.
++void Simulator::UnalignedAccess(const char* msg, uword addr, Instr* instr) {
++  // The debugger will not be able to single step past this instruction, but
++  // it will be possible to disassemble the code and inspect registers.
++  char buffer[64];
++  snprintf(buffer, sizeof(buffer), "unaligned %s at 0x%" Px ", pc=%p\n", msg,
++           addr, instr);
++  SimulatorDebugger dbg(this);
++  dbg.Stop(instr, buffer);
++  // The debugger will return control in non-interactive mode.
++  FATAL("Cannot continue execution after unaligned access.");
++}
++
+ void Simulator::UnimplementedInstruction(Instr* instr) {
+   char buffer[64];
+   snprintf(buffer, sizeof(buffer), "Unimplemented instruction: pc=%p\n", instr);
+@@ -996,39 +1016,67 @@ void Simulator::UnimplementedInstruction(Instr* instr) {
+ }
+ 
+ DART_FORCE_INLINE intptr_t Simulator::ReadW(uword addr, Instr* instr) {
+-  return *reinterpret_cast<intptr_t*>(addr);
++  if ((addr & 3) == 0) {
++    intptr_t* ptr = reinterpret_cast<intptr_t*>(addr);
++    return *ptr;
++  }
++  UnalignedAccess("read", addr, instr);
++  return 0;
+ }
+ 
+ DART_FORCE_INLINE void Simulator::WriteW(uword addr,
+                                          intptr_t value,
+                                          Instr* instr) {
+-  *reinterpret_cast<intptr_t*>(addr) = value;
++  if ((addr & 3) == 0) {
++    intptr_t* ptr = reinterpret_cast<intptr_t*>(addr);
++    *ptr = value;
++    return;
++  }
++  UnalignedAccess("write", addr, instr);
+ }
+ 
+ DART_FORCE_INLINE uint16_t Simulator::ReadHU(uword addr, Instr* instr) {
+-  return *reinterpret_cast<uint16_t*>(addr);
++  if ((addr & 1) == 0) {
++    uint16_t* ptr = reinterpret_cast<uint16_t*>(addr);
++    return *ptr;
++  }
++  UnalignedAccess("unsigned halfword read", addr, instr);
++  return 0;
+ }
+ 
+ DART_FORCE_INLINE int16_t Simulator::ReadH(uword addr, Instr* instr) {
+-  return *reinterpret_cast<int16_t*>(addr);
++  if ((addr & 1) == 0) {
++    int16_t* ptr = reinterpret_cast<int16_t*>(addr);
++    return *ptr;
++  }
++  UnalignedAccess("signed halfword read", addr, instr);
++  return 0;
+ }
+ 
+ DART_FORCE_INLINE void Simulator::WriteH(uword addr,
+                                          uint16_t value,
+                                          Instr* instr) {
+-  *reinterpret_cast<uint16_t*>(addr) = value;
++  if ((addr & 1) == 0) {
++    uint16_t* ptr = reinterpret_cast<uint16_t*>(addr);
++    *ptr = value;
++    return;
++  }
++  UnalignedAccess("halfword write", addr, instr);
+ }
+ 
+ DART_FORCE_INLINE uint8_t Simulator::ReadBU(uword addr) {
+-  return *reinterpret_cast<uint8_t*>(addr);
++  uint8_t* ptr = reinterpret_cast<uint8_t*>(addr);
++  return *ptr;
+ }
+ 
+ DART_FORCE_INLINE int8_t Simulator::ReadB(uword addr) {
+-  return *reinterpret_cast<int8_t*>(addr);
++  int8_t* ptr = reinterpret_cast<int8_t*>(addr);
++  return *ptr;
+ }
+ 
+ DART_FORCE_INLINE void Simulator::WriteB(uword addr, uint8_t value) {
+-  *reinterpret_cast<uint8_t*>(addr) = value;
++  uint8_t* ptr = reinterpret_cast<uint8_t*>(addr);
++  *ptr = value;
+ }
+ 
+ void Simulator::ClearExclusive() {
+@@ -1618,6 +1666,10 @@ DART_FORCE_INLINE void Simulator::DecodeType01(Instr* instr) {
+             // Format(instr, "mul'cond's 'rn, 'rm, 'rs");
+             uint32_t alu_out = rm_val * rs_val;
+             if (instr->Bits(21, 3) == 3) {  // mls
++              if (TargetCPUFeatures::arm_version() != ARMv7) {
++                UnimplementedInstruction(instr);
++                break;
++              }
+               alu_out = -alu_out;
+             }
+             alu_out += rd_val;
+@@ -1748,14 +1800,18 @@ DART_FORCE_INLINE void Simulator::DecodeType01(Instr* instr) {
+       switch (instr->Bits(20, 5)) {
+         case 16:
+         case 20: {
+-          uint16_t imm16 = instr->MovwField();
+-          Register rd = instr->RdField();
+-          if (instr->Bit(22) == 0) {
+-            // Format(instr, "movw'cond 'rd, #'imm4_12");
+-            set_register(rd, imm16);
++          if (TargetCPUFeatures::arm_version() == ARMv7) {
++            uint16_t imm16 = instr->MovwField();
++            Register rd = instr->RdField();
++            if (instr->Bit(22) == 0) {
++              // Format(instr, "movw'cond 'rd, #'imm4_12");
++              set_register(rd, imm16);
++            } else {
++              // Format(instr, "movt'cond 'rd, #'imm4_12");
++              set_register(rd, (get_register(rd) & 0xffff) | (imm16 << 16));
++            }
+           } else {
+-            // Format(instr, "movt'cond 'rd, #'imm4_12");
+-            set_register(rd, (get_register(rd) & 0xffff) | (imm16 << 16));
++            UnimplementedInstruction(instr);
+           }
+           break;
+         }
+-- 
+2.40.1
+

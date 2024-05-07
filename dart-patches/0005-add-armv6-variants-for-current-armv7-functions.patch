@@ -1,0 +1,188 @@
+From b84d3d18087a533d18bddfba9e66e3dbaa75d780 Mon Sep 17 00:00:00 2001
+From: Hannes Winkler <hanneswinkler2000@web.de>
+Date: Thu, 7 Mar 2024 15:24:49 +0100
+Subject: [PATCH 5/8] add armv6 variants for current armv7 functions   -
+ ExtendValue used ubfx and sbfx, replace with     uxth, sxth, uxtb, sxtb   -
+ ExtractClassIdFromTags used ubfx, replace with lsr
+
+---
+ .../vm/compiler/assembler/assembler_arm.cc    | 101 ++++++++++++++++--
+ runtime/vm/compiler/assembler/assembler_arm.h |  15 ++-
+ 2 files changed, 109 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/vm/compiler/assembler/assembler_arm.cc b/runtime/vm/compiler/assembler/assembler_arm.cc
+index 21fda793506..da45aca1259 100644
+--- a/runtime/vm/compiler/assembler/assembler_arm.cc
++++ b/runtime/vm/compiler/assembler/assembler_arm.cc
+@@ -560,6 +560,8 @@ void Assembler::sbfx(Register rd,
+                      int32_t lsb,
+                      int32_t width,
+                      Condition cond) {
++  ASSERT(TargetCPUFeatures::arm_version() == ARMv7);
++
+   const bool sign_extend = true;
+   Emit(BitFieldExtractEncoding(sign_extend, rd, rn, lsb, width, cond));
+ }
+@@ -569,10 +571,75 @@ void Assembler::ubfx(Register rd,
+                      int32_t lsb,
+                      int32_t width,
+                      Condition cond) {
++  ASSERT(TargetCPUFeatures::arm_version() == ARMv7);
++
+   const bool sign_extend = false;
+   Emit(BitFieldExtractEncoding(sign_extend, rd, rn, lsb, width, cond));
+ }
+ 
++void Assembler::uxtb(Register rd,
++                     Register rm,
++                     Condition cond) {
++  ASSERT(rm != kNoRegister && rm != PC);
++  ASSERT(rd != kNoRegister && rd != PC);
++  ASSERT(cond != kNoCondition);
++
++  int32_t encoded = (static_cast<int32_t>(cond) << kConditionShift)
++         | B26 | B25 | B23 |  B22 | B21 | B19 | B18 | B17 | B16 | 
++         (static_cast<int32_t>(rd) << kRdShift) |
++         (0 << 10)
++         | B6 | B5 | B4 |
++         (static_cast<int32_t>(rm) << kRmShift);
++  Emit(encoded);
++}
++
++void Assembler::sxtb(Register rd,
++                    Register rm,
++                    Condition cond) {
++  ASSERT(rm != kNoRegister && rm != PC);
++  ASSERT(rd != kNoRegister && rd != PC);
++  ASSERT(cond != kNoCondition);
++
++  int32_t encoded = (static_cast<int32_t>(cond) << kConditionShift)
++         | B26 | B25 | B23 | B21 | B19 | B18 | B17 | B16 | 
++         (static_cast<int32_t>(rd) << kRdShift) |
++         (0 << 10) | B6 | B5 | B4 |
++         (static_cast<int32_t>(rm) << kRmShift);
++  Emit(encoded);
++}
++
++void Assembler::uxth(Register rd,
++                     Register rm,
++                     Condition cond) {
++  ASSERT(rm != kNoRegister && rm != PC);
++  ASSERT(rd != kNoRegister && rd != PC);
++  ASSERT(cond != kNoCondition);
++
++  int32_t encoded = (static_cast<int32_t>(cond) << kConditionShift)
++         | B26 | B25 | B23 |  B22 | B21 | B20 | B19 | B18 | B17 | B16 | 
++         (static_cast<int32_t>(rd) << kRdShift) |
++         (0 << 10)
++         | B6 | B5 | B4 |
++         (static_cast<int32_t>(rm) << kRmShift);
++  Emit(encoded);
++}
++
++void Assembler::sxth(Register rd,
++                     Register rm,
++                     Condition cond) {
++  ASSERT(rm != kNoRegister && rm != PC);
++  ASSERT(rd != kNoRegister && rd != PC);
++  ASSERT(cond != kNoCondition);
++
++  int32_t encoded = (static_cast<int32_t>(cond) << kConditionShift)
++         | B26 | B25 | B23 | B21 | B20 | B19 | B18 | B17 | B16 | 
++         (static_cast<int32_t>(rd) << kRdShift) |
++         (0 << 10)
++         | B6 | B5 | B4 |
++         (static_cast<int32_t>(rm) << kRmShift);
++  Emit(encoded);
++}
++
+ void Assembler::EnterFullSafepoint(Register addr, Register state) {
+   // We generate the same number of instructions whether or not the slow-path is
+   // forced. This simplifies GenerateJitCallbackTrampolines.
+@@ -2048,8 +2115,14 @@ void Assembler::ExtractClassIdFromTags(Register result,
+                                        Condition cond) {
+   ASSERT(target::UntaggedObject::kClassIdTagPos == 12);
+   ASSERT(target::UntaggedObject::kClassIdTagSize == 20);
+-  ubfx(result, tags, target::UntaggedObject::kClassIdTagPos,
+-       target::UntaggedObject::kClassIdTagSize, cond);
++
++  // extracting bits 12..31 from a 32-bit register is just the same
++  // as a logical right shift
++  //
++  // ubfx(result, tags, target::UntaggedObject::kClassIdTagPos,
++  //      target::UntaggedObject::kClassIdTagSize, cond);
++
++  Lsr(result, tags, Operand(target::UntaggedObject::kClassIdTagPos), cond);
+ }
+ 
+ void Assembler::ExtractInstanceSizeFromTags(Register result, Register tags) {
+@@ -2717,13 +2790,29 @@ void Assembler::ExtendValue(Register rd,
+       if (rd == rm) return;
+       return mov(rd, Operand(rm), cond);
+     case kUnsignedTwoBytes:
+-      return ubfx(rd, rm, 0, kBitsPerInt16, cond);
++      if (TargetCPUFeatures::arm_version() == ARMv7) {
++        return ubfx(rd, rm, 0, kBitsPerInt16, cond);
++      } else {
++        return uxth(rd, rm, cond);
++      }
+     case kTwoBytes:
+-      return sbfx(rd, rm, 0, kBitsPerInt16, cond);
++      if (TargetCPUFeatures::arm_version() == ARMv7) {
++        return sbfx(rd, rm, 0, kBitsPerInt16, cond);
++      } else {
++        return sxth(rd, rm, cond);
++      }
+     case kUnsignedByte:
+-      return ubfx(rd, rm, 0, kBitsPerInt8, cond);
++      if (TargetCPUFeatures::arm_version() == ARMv7) {
++        return ubfx(rd, rm, 0, kBitsPerInt8, cond);
++      } else {
++        return uxtb(rd, rm, cond);
++      }
+     case kByte:
+-      return sbfx(rd, rm, 0, kBitsPerInt8, cond);
++      if (TargetCPUFeatures::arm_version() == ARMv7) {
++        return sbfx(rd, rm, 0, kBitsPerInt8, cond);
++      } else {
++        return sxtb(rd, rm, cond);
++      }
+     default:
+       UNIMPLEMENTED();
+       break;
+diff --git a/runtime/vm/compiler/assembler/assembler_arm.h b/runtime/vm/compiler/assembler/assembler_arm.h
+index 938b8aee2bf..ca5a6326578 100644
+--- a/runtime/vm/compiler/assembler/assembler_arm.h
++++ b/runtime/vm/compiler/assembler/assembler_arm.h
+@@ -615,7 +615,7 @@ class Assembler : public AssemblerBase {
+ 
+   void dmb();
+ 
+-  // Media instructions.
++  // Media instructions. ARMv7 only
+   void sbfx(Register rd,
+             Register rn,
+             int32_t lsb,
+@@ -626,6 +626,19 @@ class Assembler : public AssemblerBase {
+             int32_t lsb,
+             int32_t width,
+             Condition cond = AL);
++  
++  void uxtb(Register rd,
++            Register rn,
++            Condition cond = AL);
++  void sxtb(Register rd,
++            Register rn,
++            Condition cond = AL);
++  void uxth(Register rd,
++            Register rn,
++            Condition cond = AL);
++  void sxth(Register rd,
++            Register rn,
++            Condition cond = AL);
+ 
+   // Emit code to transition between generated and native modes.
+   //
+-- 
+2.40.1
+

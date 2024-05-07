@@ -1,0 +1,27 @@
+From 05654312b281166f0c08333243e7a680cfa7be95 Mon Sep 17 00:00:00 2001
+From: Hannes Winkler <hanneswinkler2000@web.de>
+Date: Thu, 7 Mar 2024 16:09:06 +0100
+Subject: [PATCH 6/8] fix native callback trampoline & stubs for armv6
+
+---
+ runtime/vm/ffi_callback_metadata.h | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/runtime/vm/ffi_callback_metadata.h b/runtime/vm/ffi_callback_metadata.h
+index 18a101836ed..59712235c2b 100644
+--- a/runtime/vm/ffi_callback_metadata.h
++++ b/runtime/vm/ffi_callback_metadata.h
+@@ -256,6 +256,10 @@ class FfiCallbackMetadata {
+   static constexpr intptr_t kNativeCallbackTrampolineSize = 10;
+   static constexpr intptr_t kNativeCallbackSharedStubSize = 146;
+   static constexpr intptr_t kNativeCallbackTrampolineStackDelta = 4;
++#elif defined(TARGET_ARCH_ARM_6)
++  static constexpr intptr_t kNativeCallbackTrampolineSize = 8;
++  static constexpr intptr_t kNativeCallbackSharedStubSize = 276;
++  static constexpr intptr_t kNativeCallbackTrampolineStackDelta = 4;
+ #elif defined(TARGET_ARCH_ARM)
+   static constexpr intptr_t kNativeCallbackTrampolineSize = 8;
+   static constexpr intptr_t kNativeCallbackSharedStubSize = 232;
+-- 
+2.40.1
+
