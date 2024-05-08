@@ -1,0 +1,247 @@
+From eedfec6e1ad64ed8517dcd72882b58aea4c9669f Mon Sep 17 00:00:00 2001
+From: Hannes Winkler <hanneswinkler2000@web.de>
+Date: Wed, 11 Aug 2021 02:21:25 +0200
+Subject: [PATCH 1/3] allow specifying arm compiler flags
+
+Allows building for armv6 and armv7 and tuning,
+enabling CPU features, etc.
+---
+ build/config/arm.gni           |  47 +++++++--------
+ build/config/compiler/BUILD.gn | 104 ++++++++++++++++++++++++---------
+ build/config/sysroot.gni       |   8 ++-
+ 3 files changed, 106 insertions(+), 53 deletions(-)
+
+diff --git a/build/config/arm.gni b/build/config/arm.gni
+index 02834cd..af0cfbe 100644
+--- a/build/config/arm.gni
++++ b/build/config/arm.gni
+@@ -19,50 +19,47 @@ if (current_cpu == "arm" || current_cpu == "arm64") {
+     # arm_version.
+     arm_float_abi = ""
+ 
++    # The target triple to build for.
++    # Passed as `--target=<arm_target>` to clang if non-empty. (if clang is being used)
++    # NOTE: Any target other than `armv7-linux-gnueabihf` is not supported
++    #       by the bundled clang right now.
++    arm_target = "armv7-linux-gnueabihf"
++    arm64_target = "aarch64-linux-gnu"
++
+     # The ARM variant-specific tuning mode. This will be a string like "armv6"
+     # or "cortex-a15". An empty string means to use the default for the
+     # arm_version.
++    # Passed as `-mtune=<arm_tune>` to the compiler.
+     arm_tune = ""
+ 
++    # Passed as `-mcpu=<arm_cpu>` to the compiler.
++    arm_cpu = ""
++
++    # Passed as `-march=<arm_arch>` to the compiler.
++    arm_arch = ""
++    
++    # Passed as `-mfpu=<arm_fpu>` to the compiler
++    arm_fpu = ""
++
+     # Whether to use the neon FPU instruction set or not.
+     arm_use_neon = true
+ 
+     # Whether to enable optional NEON code paths.
+     arm_optionally_use_neon = false
++
++    arm64_arch = ""
++    arm64_cpu = ""
++    arm64_tune = ""
+   }
+ 
+   assert(arm_float_abi == "" || arm_float_abi == "hard" ||
+          arm_float_abi == "soft" || arm_float_abi == "softfp")
+ 
+-  if (arm_version == 6) {
+-    arm_arch = "armv6"
+-    if (arm_tune != "") {
+-      arm_tune = ""
+-    }
+-    if (arm_float_abi == "") {
+-      arm_float_abi = "softfp"
+-    }
+-    arm_fpu = "vfp"
+-
+-    # Thumb is a reduced instruction set available on some ARM processors that
+-    # has increased code density.
+-    arm_use_thumb = false
+-  } else if (arm_version == 7) {
+-    arm_arch = "armv7-a"
+-    if (arm_tune == "") {
+-      arm_tune = "generic-armv7-a"
+-    }
+-
++  if (arm_version == 7) {
+     if (arm_float_abi == "") {
+       arm_float_abi = "softfp"
+     }
+ 
+     arm_use_thumb = true
+-
+-    if (arm_use_neon) {
+-      arm_fpu = "neon"
+-    } else {
+-      arm_fpu = "vfpv3-d16"
+-    }
+   }
+ }
+diff --git a/build/config/compiler/BUILD.gn b/build/config/compiler/BUILD.gn
+index e22ac44..4540f09 100644
+--- a/build/config/compiler/BUILD.gn
++++ b/build/config/compiler/BUILD.gn
+@@ -4,7 +4,7 @@
+ 
+ import("//build/config/android/config.gni")
+ import("//build/toolchain/wasm.gni")
+-if (current_cpu == "arm") {
++if (current_cpu == "arm" || current_cpu == "arm64") {
+   import("//build/config/arm.gni")
+ }
+ if (is_posix) {
+@@ -211,33 +211,85 @@ config("compiler") {
+         ]
+       }
+     } else if (current_cpu == "arm") {
+-      cflags += [
+-        "-march=$arm_arch",
+-        "-mfloat-abi=$arm_float_abi",
+-      ]
+-      if (arm_tune != "") {
+-        cflags += [ "-mtune=$arm_tune" ]
+-      }
+-      if (arm_use_thumb) {
+-        cflags += [ "-mthumb" ]
+-        if (is_android && !is_clang) {  # Clang doesn't support this option.
+-          cflags += [ "-mthumb-interwork" ]
++      if (is_clang) {
++        if (arm_float_abi == "softfp" || arm_float_abi == "soft") {
++          assert(false, "ARM softfloat is not supported by the bundled clang right now.")
+         }
+-      }
+-      if (!is_clang) {
+-        # Clang doesn't support these flags.
++
++        # Any other target is not supported by the bundled clang right now.
++        # (the compiler-rt binaries inside srC/buildtools/linux-x64/clang/lib/clang/13.0.0/lib are not provided for anything else)
++        # If we specify something other than `armv7` (like `arm`, `armv7a`, `armv7-a`, `armv7l`) as the first part of the target triple,
++        # clang will attempt to load the compiler builtins (compiler-rt) from
++        #   `buildtools/linux-x64/clang/lib/clang/13.0.0/lib/linux/libclang_rt.builtins-armhf.a`
++        # instead of from
++        #   `buildtools/linux-x64/clang/lib/clang/13.0.0/lib/armv7-unknown-linux-gnueabihf/libclang_rt.builtins.a`,
++        # resulting in errors.
++        #
++        # You can use
++        #   `buildtools/linux-x64/clang/bin/clang++ --rtlib=compiler-rt --target=<target-triple> --print-libgcc-file-name`
++        # to print the compiler builtin location btw.
++        # (took me like a day to debug all this)
++        
++        if (arm_target != "") {
++          cflags += ["--target=$arm_target"]
++          ldflags += ["--target=$arm_target"]
++        }
++        if (arm_arch != "") {
++          cflags += [ "-march=$arm_arch" ]
++        }
++        if (arm_cpu != "") {
++          cflags += [ "-mcpu=$arm_cpu" ]
++        }
++        if (arm_tune != "") {
++          cflags += [ "-mtune=$arm_tune" ]
++        }
++        if (arm_fpu != "") {
++          cflags += [ "-mfpu=$arm_fpu" ]
++        }
++      } else {
+         cflags += [
+-          # The tree-sra optimization (scalar replacement for
+-          # aggregates enabling subsequent optimizations) leads to
+-          # invalid code generation when using the Android NDK's
+-          # compiler (r5-r7). This can be verified using
+-          # webkit_unit_tests' WTF.Checked_int8_t test.
+-          "-fno-tree-sra",
+-
+-          # The following option is disabled to improve binary
+-          # size and performance in gcc 4.9.
+-          "-fno-caller-saves",
++          "-march=$arm_arch",
++          "-mfloat-abi=$arm_float_abi",
+         ]
++        if (arm_tune != "") {
++          cflags += [ "-mtune=$arm_tune" ]
++        }
++        if (arm_use_thumb) {
++          cflags += [ "-mthumb" ]
++          if (is_android && !is_clang) {  # Clang doesn't support this option.
++            cflags += [ "-mthumb-interwork" ]
++          }
++        }
++        if (!is_clang) {
++          # Clang doesn't support these flags.
++          cflags += [
++            # The tree-sra optimization (scalar replacement for
++            # aggregates enabling subsequent optimizations) leads to
++            # invalid code generation when using the Android NDK's
++            # compiler (r5-r7). This can be verified using
++            # webkit_unit_tests' WTF.Checked_int8_t test.
++            "-fno-tree-sra",
++
++            # The following option is disabled to improve binary
++            # size and performance in gcc 4.9.
++            "-fno-caller-saves",
++          ]
++        }
++      }
++    } else if (current_cpu == "arm64") {
++      assert(is_clang)
++      if (arm64_target != "") {
++        cflags += [ "--target=$arm64_target" ]
++        ldflags += [ "--target=$arm64_target" ]
++      }
++      if (arm64_arch != "") {
++        cflags += [ "-march=$arm64_arch" ]
++      }
++      if (arm64_cpu != "") {
++        cflags += [ "-mcpu=$arm64_cpu" ]
++      }
++      if (arm64_tune != "") {
++        cflags += [ "-mtune=$arm64_tune" ]
+       }
+     }
+ 
+@@ -351,8 +403,6 @@ config("compiler") {
+     ldflags += [ "-pthread" ]
+ 
+     if (current_cpu == "arm64") {
+-      cflags += [ "--target=aarch64-linux-gnu" ]
+-      ldflags += [ "--target=aarch64-linux-gnu" ]
+       cflags += [ "-DBORINGSSL_CLANG_SUPPORTS_DOT_ARCH" ]
+     }
+   }
+diff --git a/build/config/sysroot.gni b/build/config/sysroot.gni
+index 97d662f..460bd79 100644
+--- a/build/config/sysroot.gni
++++ b/build/config/sysroot.gni
+@@ -27,10 +27,16 @@ if (current_toolchain == default_toolchain && target_sysroot != "") {
+     if (current_cpu == "x64") {
+       sysroot =
+           rebase_path("//build/linux/debian_sid_amd64-sysroot", root_build_dir)
+-    } else {
++    } else if (current_cpu == "arm64") {
+       sysroot =
+           rebase_path("//build/linux/debian_sid_arm64-sysroot", root_build_dir)
++    } else if (current_cpu == "arm") {
++      sysroot =
++          rebase_path("//build/linux/debian_sid_arm-sysroot", root_build_dir)
++    } else {
++      assert(false, "Unknown CPU: $current_cpu.")
+     }
++
+     assert(
+         exec_script("//build/dir_exists.py", [ sysroot ], "string") == "True",
+         "Missing sysroot ($sysroot). To fix, run: build/linux/sysroot_scripts/install-sysroot.py --arch=$current_cpu")
+-- 
+2.39.2
+

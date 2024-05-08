@@ -1,4 +1,4 @@
-From 665da73139cf99e746ac9ad1f4cef47b793f47eb Mon Sep 17 00:00:00 2001
+From cb4d2244acbd9983b7be6f1f8628b46f31ca7f16 Mon Sep 17 00:00:00 2001
 From: Hannes Winkler <hanneswinkler2000@web.de>
 Date: Tue, 7 May 2024 17:18:05 +0200
 Subject: [PATCH 3/3] remove freetype2 dependency
@@ -27,5 +27,5 @@ index b3ca187..734510a 100644
  config("x11") {
    libs = [
 -- 
-2.40.1
+2.39.2
 
