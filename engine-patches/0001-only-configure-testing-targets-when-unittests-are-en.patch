@@ -1,0 +1,111 @@
+From ee7a97e6ebd04e9c77785b91be068766cbbd1f39 Mon Sep 17 00:00:00 2001
+From: Hannes Winkler <hannes.winkler@kdab.com>
+Date: Sun, 19 May 2024 18:58:52 +0000
+Subject: [PATCH] only configure testing targets when unittests are enabled
+
+Avoids looking for gtk, which is not installed in the sysroot we use.
+---
+ display_list/BUILD.gn    | 48 ++++++++++++++++++++--------------------
+ shell/profiling/BUILD.gn | 17 ++++++++------
+ 2 files changed, 34 insertions(+), 31 deletions(-)
+
+diff --git a/display_list/BUILD.gn b/display_list/BUILD.gn
+index 2e93c2002b..96d7a7dceb 100644
+--- a/display_list/BUILD.gn
++++ b/display_list/BUILD.gn
+@@ -201,35 +201,35 @@ if (enable_unittests) {
+       "//flutter/testing:testing_lib",
+     ]
+   }
+-}
+ 
+-source_set("display_list_benchmarks_source") {
+-  testonly = true
++  source_set("display_list_benchmarks_source") {
++    testonly = true
+ 
+-  sources = [
+-    "benchmarking/dl_benchmarks.cc",
+-    "benchmarking/dl_benchmarks.h",
+-  ]
++    sources = [
++      "benchmarking/dl_benchmarks.cc",
++      "benchmarking/dl_benchmarks.h",
++    ]
+ 
+-  deps = [
+-    ":display_list",
+-    ":display_list_fixtures",
+-    "//flutter/benchmarking",
+-    "//flutter/common/graphics",
+-    "//flutter/display_list/testing:display_list_surface_provider",
+-    "//flutter/display_list/testing:display_list_testing",
+-    "//flutter/fml",
+-    "//flutter/skia",
+-    "//flutter/testing:skia",
+-    "//flutter/testing:testing_lib",
+-    "//third_party/dart/runtime:libdart_jit",  # for tracing
+-  ]
+-}
++    deps = [
++      ":display_list",
++      ":display_list_fixtures",
++      "//flutter/benchmarking",
++      "//flutter/common/graphics",
++      "//flutter/display_list/testing:display_list_surface_provider",
++      "//flutter/display_list/testing:display_list_testing",
++      "//flutter/fml",
++      "//flutter/skia",
++      "//flutter/testing:skia",
++      "//flutter/testing:testing_lib",
++      "//third_party/dart/runtime:libdart_jit",  # for tracing
++    ]
++  }
+ 
+-executable("display_list_benchmarks") {
+-  testonly = true
++  executable("display_list_benchmarks") {
++    testonly = true
+ 
+-  deps = [ ":display_list_benchmarks_source" ]
++    deps = [ ":display_list_benchmarks_source" ]
++  }
+ }
+ 
+ if (is_ios) {
+diff --git a/shell/profiling/BUILD.gn b/shell/profiling/BUILD.gn
+index 457ef6d297..502b034614 100644
+--- a/shell/profiling/BUILD.gn
++++ b/shell/profiling/BUILD.gn
+@@ -3,6 +3,7 @@
+ # found in the LICENSE file.
+ 
+ import("//flutter/shell/config.gni")
++import("//flutter/testing/testing.gni")
+ 
+ _profiler_deps = [
+   "//flutter/common",
+@@ -18,11 +19,13 @@ source_set("profiling") {
+   deps = _profiler_deps
+ }
+ 
+-source_set("profiling_unittests") {
+-  testonly = true
+-  sources = [ "sampling_profiler_unittest.cc" ]
+-  deps = [
+-    ":profiling",
+-    "//flutter/testing",
+-  ]
++if (enable_unittests) {
++  source_set("profiling_unittests") {
++    testonly = true
++    sources = [ "sampling_profiler_unittest.cc" ]
++    deps = [
++      ":profiling",
++      "//flutter/testing",
++    ]
++  }
+ }
+-- 
+2.39.2
+
